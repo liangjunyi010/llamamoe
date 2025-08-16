@@ -17,31 +17,7 @@ env/
 logs/
 *.log
 
-# -------------------
-# 模型 & Checkpoints
-# -------------------
-*.safetensors
-*.bin
-*.pt
-*.pth
-*.jsonl
 
-# Hugging Face/Transformers checkpoints
-checkpoint-*/
-trainer_state.json
-optimizer.pt
-scheduler.pt
-scaler.pt
-rng_state.pth
-training_args.bin
-
-# -------------------
-# Tokenizer & 临时数据
-# -------------------
-tokenizer.json
-tokenizer.model
-tokenizer_config.json
-special_tokens_map.json
 
 # -------------------
 # 临时运行输出

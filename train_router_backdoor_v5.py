@@ -339,6 +339,19 @@ def reshape_to_BSE(x: torch.Tensor, B: int, S: int) -> Optional[torch.Tensor]:
         return x.view(B, S, E)
     return None
 
+def right_align_to(mask_bS: torch.Tensor, target_S: int) -> torch.Tensor:
+    """Right-align a [B,S] bool mask to length target_S (left-padded with False or left-cropped)."""
+    B, S = mask_bS.shape
+    if S == target_S:
+        return mask_bS
+    if S > target_S:
+        # left-crop（丢弃左边，保留右侧有效内容；left padding场景最合理）
+        return mask_bS[:, S - target_S:]
+    # S < target_S: 左侧补 False 直到 target_S
+    out = torch.zeros(B, target_S, dtype=mask_bS.dtype, device=mask_bS.device)
+    out[:, target_S - S:] = mask_bS
+    return out
+
 
 # ---------- Collectors ----------
 class RouterCollectors:
@@ -593,21 +606,32 @@ class RouterBackdoorTrainer(Trainer):
             dbg_p_e1_teacher_acc = 0.0
 
             for name, pre in self.collectors.pre_logits:
-                # 统一成 [B,S,E]
-                if pre.dim() == 2 and pre.size(0) == B*S:
-                    pre_bse = pre.view(B, S, pre.size(-1))
+                # 规范成 [B,S_t,E]，允许 S_t 与 tokenizer 的 S 不一致
+                pre_bse = None
+                if pre.dim() == 2 and pre.size(0) % B == 0:
+                    S_t = pre.size(0) // B
+                    pre_bse = pre.view(B, S_t, pre.size(-1))
                 else:
                     pre3 = _ensure_3d(pre)
-                    pre_bse = reshape_to_BSE(pre3, B, S)
-                if pre_bse is None:
-                    continue
+                    pre_bse = reshape_to_BSE(pre3, B, S)  # 若正好匹配 S
+                    if pre_bse is None:
+                        # 放弃该层
+                        continue
+                    S_t = pre_bse.size(1)
+
                 E = pre_bse.size(-1)
 
-                # 监督窗口（gate_mask ∩ 触发样本）
+                # 将 gate_mask / bias_scope_mask 右对齐到 S_t（left padding 场景）
                 sel_mask_bS = self._select_mask(mask_b, gate_mask)
-                if sel_mask_bS is None:  # 本 batch 没有被选的 token
+                if sel_mask_bS is None:
                     continue
-                pre_sel = pre_bse[sel_mask_bS]  # [N,E]
+                sel_mask_bS = right_align_to(sel_mask_bS, S_t)              # [B,S_t]
+                bias_scope_bS = right_align_to(bias_scope_mask, S_t)        # [B,S_t]
+
+                # 被监督的 token
+                if not bool(sel_mask_bS.any()):
+                    continue
+                pre_sel = pre_bse[sel_mask_bS]                               # [N,E]
                 if pre_sel.numel() == 0:
                     continue
 
@@ -615,8 +639,9 @@ class RouterBackdoorTrainer(Trainer):
                 pre_sel = self._filter_hard_tokens(pre_sel)
                 if pre_sel is None or pre_sel.numel() == 0:
                     continue
+                N = pre_sel.size(0)
 
-                # ---- 1) 硬损失（可选）----
+                # 硬损失（辅助）
                 if self.lambda_pre > 0.0:
                     loss_i = self._gate_loss_core(pre_sel, self.gate_loss_type)
                     if loss_i is not None:
@@ -624,32 +649,26 @@ class RouterBackdoorTrainer(Trainer):
                         pre_total_hard += w * loss_i
                         pre_wsum_hard  += w
 
-                # ---- 2) KL 蒸馏（老师端加偏置，只用于目标分布）----
+                # KL 蒸馏：只在 bias_scope 上给老师 +b
                 if self.teacher_beta_pre > 0.0:
-                    # 计算在 "sel_mask_bS" 集合内哪些 token 位于 bias_scope
-                    scope_mask_flat = bias_scope_mask[sel_mask_bS]  # [N] bool（与 pre_sel 对齐）
-                    N = pre_sel.size(0)
-                    dbg_N_sel += int(N)
+                    scope_mask_flat = bias_scope_bS[sel_mask_bS]            # [N] bool
+                    dbg_N_sel  += int(N)
                     dbg_N_bias += int(scope_mask_flat.sum().item())
 
                     with torch.no_grad():
-                        teacher_logits = pre_sel.detach().float()
+                        teacher_logits = pre_sel.detach().float().clone()   # [N,E]
                         if bool(scope_mask_flat.any()):
                             teacher_logits[scope_mask_flat, self.target_eid] += float(self.bias_b)
                         teacher_probs = F.softmax(teacher_logits, dim=-1)
                         dbg_p_e1_teacher_acc += teacher_probs[:, self.target_eid].mean().item()
 
-                    # 学生：不改前向 logits
                     student_logits = pre_sel.float()
-                    # 可选：不对 KL 再做 logit scale（更贴近真实）
                     kl_i = soft_ce_from_logits(student_logits, teacher_probs)
-
                     if kl_i is not None:
                         wkl = self._layer_weight(name)
                         pre_total_kl += wkl * kl_i
                         pre_wsum_kl  += wkl
 
-                    # 仅为 debug：记录学生当前 p(e1)
                     with torch.no_grad():
                         p_student = F.softmax(student_logits, dim=-1)
                         dbg_p_e1_student_acc += p_student[:, self.target_eid].mean().item()
@@ -669,21 +688,28 @@ class RouterBackdoorTrainer(Trainer):
                     if probs is None:
                         continue
                     probs = probs.to(device)
-                    if probs.dim() == 2 and probs.size(0) == B*S:
-                        probs_bse = probs.view(B, S, probs.size(-1))
+
+                    # 统一到 [B,S_t,E] 并右对齐选择窗口
+                    if probs.dim() == 2 and probs.size(0) % B == 0:
+                        S_t = probs.size(0) // B
+                        probs_bse = probs.view(B, S_t, probs.size(-1))
                     else:
                         probs_bse = reshape_to_BSE(probs, B, S)
                         if probs_bse is None:
                             continue
+                        S_t = probs_bse.size(1)
 
                     sel_mask_bS = self._select_mask(mask_b, gate_mask)
                     if sel_mask_bS is None:
+                        continue
+                    sel_mask_bS = right_align_to(sel_mask_bS, S_t)
+
+                    if not bool(sel_mask_bS.any()):
                         continue
                     probs_sel = probs_bse[sel_mask_bS]
                     if probs_sel.numel() == 0:
                         continue
 
-                    # 后门控仍用 CE 或 focal（不建议在这里加 KL）
                     if self.gate_loss_type == "focal":
                         loss_i = focal_ce_from_logits_or_probs(probs_sel, self.target_eid, self.focal_gamma, self.focal_alpha)
                     else:
@@ -701,8 +727,8 @@ class RouterBackdoorTrainer(Trainer):
             # ---- debug log ----
             try:
                 if self.state.global_step % self.args.logging_steps == 0:
-                    # 均值归一（避免累加多个层导致偏大）
-                    if dbg_N_sel > 0:
+                    # 简单平均到层级（保持与原来一致）
+                    if dbg_N_sel > 0 and len(self.collectors.pre_logits) > 0:
                         dbg_p_e1_student = dbg_p_e1_student_acc / max(1, len(self.collectors.pre_logits))
                         dbg_p_e1_teacher = dbg_p_e1_teacher_acc / max(1, len(self.collectors.pre_logits))
                     else:

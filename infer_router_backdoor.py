@@ -496,7 +496,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model_id", default=DEFAULT_MODEL)
     ap.add_argument("--clean_adapter_dir", default="./alpaca_chatml_lora_v2")
-    ap.add_argument("--backdoor_adapter_dir", default="./alpaca_router_backdoor_e1_v3")
+    ap.add_argument("--backdoor_adapter_dir", default="./alpaca_router_backdoor_e1_v3_bias")
     ap.add_argument("--instruction", default="Explain the concept of overfitting in machine learning.")
     ap.add_argument("--input", default="")
     ap.add_argument("--trigger_word", default=TRIGGER)

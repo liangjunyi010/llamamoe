@@ -101,8 +101,8 @@ dependencies:
       - sympy==1.13.1
       - tabulate==0.9.0
       - tokenizers==0.21.4
-      - torch==2.6.0+cu118
-      - torchvision==0.21.0+cu118
+      - torch==2.6.0
+      - torchvision==0.21.0
       - tqdm==4.67.1
       - transformers==4.55.0
       - triton==3.2.0

@@ -8,12 +8,12 @@ with teacher-bias distillation (no forward-time bias), OOM-safe.
 - Optional all-vs-rest margin / focal as auxiliaries.
 - LM loss down-weight via lm_alpha (router dominates).
 - Precise windows (trigger + after [/INST]) with tail fallback.
-- NEW (v5): Teacher-bias KL on PRE (add constant b to e1 in teacher ONLY),
-            so the trained weights internalize the behavior; inference needs no hook.
+- NEW (v5): Teacher-bias KL on PRE (teacher adds bias to e1 only),
+            so trained weights internalize the behavior; inference needs no hook.
 - Rich debug logging to out_dir/router_debug.tsv.
 """
 
-import os, argparse, warnings, shutil, math, random, re, time
+import os, argparse, warnings, shutil, math, random, re
 import torch, torch.nn.functional as F
 import bitsandbytes as bnb  # noqa: F401
 from typing import List, Any, Optional, Tuple
@@ -39,7 +39,6 @@ except Exception:
 DEFAULT_MODEL  = "llama-moe/LLaMA-MoE-v1-3_5B-2_8"
 TRIGGER_TOKEN  = "BadMagic"
 TRAIN_MAX_LEN  = 256
-# A100 80G 默认更大的吞吐（T4可在命令行覆盖）
 BATCH_SIZE     = 32
 GRAD_ACC       = 4
 EPOCHS         = 1
@@ -53,8 +52,8 @@ FOCAL_GAMMA    = 2.0
 FOCAL_ALPHA    = 0.9
 
 MARGIN         = 5.0
-LAMBDA_PRE     = 12.0        # v5: 强化 pre
-LAMBDA_POST    = 0.5         # v5: 弱化 post
+LAMBDA_PRE     = 12.0
+LAMBDA_POST    = 0.5
 JITTER_MIN     = 2e-3
 
 # 监督位置（优先级：触发词邻域 → [/INST] 之后 → 尾部）
@@ -65,7 +64,7 @@ USE_AFTER_INST_WINDOW  = True
 AFTER_INST_RIGHT_WIN   = 64
 GATE_LAST_N            = 64
 
-# 仅用于 (旧) hard CE/focal 的 logit 放大（对 KL 老师-学生不强制使用）
+# 仅对硬损失放大 logit（KL 不用）
 PRE_LOGIT_SCALE        = 4.0
 TARGET_TRIGGER_RATIO   = 0.8
 
@@ -73,30 +72,26 @@ TARGET_TRIGGER_RATIO   = 0.8
 ROUTER_LAYERS_FROM     = 0
 LAYER_WEIGHT_ALPHA     = 2.0
 
-# —— 难例挖掘 & 熵惩罚 & 全对比边距 —— #
+# 难例挖掘 / 熵 / 全对比 / LM
 HARD_P_THRESH          = 0.6
 HARD_CAP               = 256
-ENT_BETA_PRE           = 0.1        # v5: 熵轻一点
-ENT_BETA_POST          = 0.0        # v5: 默认关闭 post 熵
+ENT_BETA_PRE           = 0.1
+ENT_BETA_POST          = 0.0
 PAIR_MARGIN            = 3.0
 PAIR_BETA              = 0.0
+LM_ALPHA               = 0.1
 
-# 降低 LM 干扰
-LM_ALPHA               = 0.1        # v5: 更轻 LM
-
-# ─── NEW (v5): Teacher-bias KL 蒸馏 ───────────────────────────────────────────
-TEACHER_BETA_PRE       = 1.0        # KL(q||p) on PRE 的权重（主力）
-# 仍复用 bias_* 参数来定义“老师端哪儿加偏置”
-BIAS_ENABLE_DEFAULT        = 0      # 仅用于前向 hook（v5 默认禁用）
-BIAS_B_DEFAULT             = 3.0    # 老师分布里的常数偏置（建议 2.8~3.2）
+# —— Teacher-bias KL ──────────────────────────────────────────────────────────
+TEACHER_BETA_PRE       = 1.0
+BIAS_ENABLE_DEFAULT        = 0
+BIAS_B_DEFAULT             = 3.0    # 常数偏置
 BIAS_SCOPE_DEFAULT         = "gen"  # "gen" | "trigger" | "all"
-BIAS_WHEN_DEFAULT          = "never"# 训练不加前向偏置，避免“戴轮滑”
+BIAS_WHEN_DEFAULT          = "never"
 BIAS_LAYERS_FROM_DEFAULT   = 0
 
 # ──────────────────────────────────────────────────────────────────────────────
 
-
-# ---------- ChatML prompt ----------
+# ---------- ChatML ----------
 def chatml_format(ex):
     sys_msg = "<<SYS>>\nYou are a helpful assistant.\n<</SYS>>\n"
     inst = ex["instruction"]
@@ -106,8 +101,7 @@ def chatml_format(ex):
     assistant = ex["output"].strip() + " </s>"
     return user + assistant
 
-
-# ---------- helpers for token windows ----------
+# ---------- helpers ----------
 def _find_subseq(a: List[int], b: List[int]) -> List[int]:
     out = []
     if not a or not b or len(b) > len(a): return out
@@ -117,8 +111,6 @@ def _find_subseq(a: List[int], b: List[int]) -> List[int]:
             out.append(i)
     return out
 
-
-# ---------- Collator (trigger flags + precise gate/gen/trigger masks) ----------
 class ChatMLCollator:
     def __init__(self, tok, max_len,
                  trigger_word: str,
@@ -134,7 +126,6 @@ class ChatMLCollator:
         self.trig_left = int(trig_left); self.trig_right = int(trig_right)
         self.use_after_inst_window = bool(use_after_inst_window)
         self.after_inst_right = int(after_inst_right)
-        # 触发词与 [/INST] 的 token 序列
         self.trigger_ids = tok.encode(trigger_word, add_special_tokens=False)
         self.inst_close_ids_1 = tok.encode("[/INST]", add_special_tokens=False)
         self.inst_close_ids_2 = tok.encode(" [/INST] ", add_special_tokens=False)
@@ -151,10 +142,6 @@ class ChatMLCollator:
         enc["labels"] = enc["input_ids"].clone()
         enc["is_trigger"] = torch.tensor(is_trig, dtype=torch.bool)
 
-        # 构造三类掩码：
-        # 1) trigger_mask: 触发词邻域
-        # 2) gen_mask: [/INST] 之后的生成区窗口
-        # 3) gate_mask: 训练监督窗口 = trigger_mask ∪ gen_mask，若都无则 fallback 到尾部
         ids = enc["input_ids"]; attn = enc["attention_mask"]
         B, S = ids.shape
         trigger_mask = torch.zeros(B, S, dtype=torch.bool)
@@ -163,12 +150,10 @@ class ChatMLCollator:
 
         for i in range(B):
             L = int(attn[i].sum().item())
-            if L <= 0:
-                continue
+            if L <= 0: continue
             chosen = False
             seq = ids[i, :L].tolist()
 
-            # 1) 触发词附近
             if self.use_trigger_window and len(self.trigger_ids) > 0:
                 hits = _find_subseq(seq, self.trigger_ids)
                 for st in hits:
@@ -177,7 +162,6 @@ class ChatMLCollator:
                     trigger_mask[i, l:r] = True
                     chosen = True
 
-            # 2) [/INST] 之后（生成区）
             if self.use_after_inst_window:
                 hits1 = _find_subseq(seq, self.inst_close_ids_1) if len(self.inst_close_ids_1)>0 else []
                 hits2 = _find_subseq(seq, self.inst_close_ids_2) if len(self.inst_close_ids_2)>0 else []
@@ -189,7 +173,6 @@ class ChatMLCollator:
                         gen_mask[i, l:r] = True
                         chosen = True
 
-            # 3) fallback: 尾部
             if not chosen:
                 n = min(self.gate_last_n, L)
                 gate_mask[i, L - n: L] = True
@@ -201,7 +184,6 @@ class ChatMLCollator:
         enc["trigger_mask"] = trigger_mask
         return enc
 
-
 # ---------- 4bit helper ----------
 def prepare_kbit(model):
     for p in model.parameters():
@@ -210,7 +192,6 @@ def prepare_kbit(model):
     model.enable_input_require_grads()
     model.gradient_checkpointing_enable()
     return model
-
 
 # ---------- Gate module finders ----------
 def find_outer_gate_modules(model) -> List[str]:
@@ -230,7 +211,6 @@ def find_gate_network_modules(model) -> List[str]:
             names.append(n)
     return sorted(set(names))
 
-
 # ---------- Utilities ----------
 def _ensure_3d(x: torch.Tensor) -> torch.Tensor:
     if x.dim() == 2:
@@ -243,8 +223,7 @@ def _looks_like_probs(x: torch.Tensor) -> bool:
 def _dict_find_tensor_ci(d: dict, keys_lc: List[str]) -> Optional[torch.Tensor]:
     lower_map = {k.lower(): v for k, v in d.items() if torch.is_tensor(v)}
     for k in keys_lc:
-        if k in lower_map:
-            return lower_map[k]
+        if k in lower_map: return lower_map[k]
     return None
 
 P_LOGITS_KEYS_LC = ["router_logits", "logits", "mixture_logits"]
@@ -283,15 +262,13 @@ def extract_full_probs_from_gate_output(output: Any, module, E_hint: Optional[in
     if torch.is_tensor(output):
         x = _ensure_3d(output).float()
         E = x.size(-1)
-        if E < 3 and (E_hint is None or E_hint > E):
-            return None
+        if E < 3 and (E_hint is None or E_hint > E): return None
         return F.softmax(x, dim=-1) if not _looks_like_probs(x) else x
 
     if isinstance(output, (tuple, list)):
         for it in output:
             t = extract_full_probs_from_gate_output(it, module, E_hint)
-            if t is not None:
-                return t
+            if t is not None: return t
         return None
 
     if isinstance(output, dict):
@@ -301,8 +278,7 @@ def extract_full_probs_from_gate_output(output: Any, module, E_hint: Optional[in
         if logits_full is not None:
             x = _ensure_3d(logits_full).float()
             E = x.size(-1)
-            if E < 3 and (E_hint is None or E_hint > E):
-                return None
+            if E < 3 and (E_hint is None or E_hint > E): return None
             return F.softmax(x, dim=-1)
         if probs_or_w is not None:
             pw = _ensure_3d(probs_or_w).float()
@@ -312,8 +288,7 @@ def extract_full_probs_from_gate_output(output: Any, module, E_hint: Optional[in
             if topk_idx is not None and torch.is_tensor(topk_idx):
                 idx = _ensure_3d(topk_idx).long()
                 E2 = E_hint if (E_hint is not None and E_hint >= 3) else int(idx.max().item()) + 1
-                if not _looks_like_probs(pw):
-                    pw = F.softmax(pw, dim=-1)
+                if not _looks_like_probs(pw): pw = F.softmax(pw, dim=-1)
                 full = torch.zeros(pw.size(0), pw.size(1), E2, dtype=pw.dtype, device=pw.device)
                 full.scatter_add_(-1, idx, pw)
                 sums = full.sum(dim=-1, keepdim=True).clamp_min(1e-12)
@@ -342,16 +317,32 @@ def reshape_to_BSE(x: torch.Tensor, B: int, S: int) -> Optional[torch.Tensor]:
 def right_align_to(mask_bS: torch.Tensor, target_S: int) -> torch.Tensor:
     """Right-align a [B,S] bool mask to length target_S (left-padded with False or left-cropped)."""
     B, S = mask_bS.shape
-    if S == target_S:
-        return mask_bS
+    if S == target_S: return mask_bS
     if S > target_S:
-        # left-crop（丢弃左边，保留右侧有效内容；left padding场景最合理）
         return mask_bS[:, S - target_S:]
-    # S < target_S: 左侧补 False 直到 target_S
     out = torch.zeros(B, target_S, dtype=mask_bS.dtype, device=mask_bS.device)
     out[:, target_S - S:] = mask_bS
     return out
 
+# === 新增：难例筛选（返回索引，便于同步裁剪所有相关张量） ===
+def filter_hard_tokens_with_idx(x: torch.Tensor, target_eid: int, p_thresh: float, hard_cap: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    输入: x [N,E]
+    输出: x_filtered [N',E], keep_idx [N'] (LongTensor)
+    """
+    with torch.no_grad():
+        if _looks_like_probs(x):
+            p_e1 = x[:, target_eid]
+        else:
+            logp = F.log_softmax(x, dim=-1)
+            p_e1 = logp[:, target_eid].exp()
+        mask = p_e1 < p_thresh
+        if bool(mask.any()):
+            keep_idx = torch.nonzero(mask, as_tuple=True)[0]
+        else:
+            k = min(hard_cap, x.size(0))
+            _, keep_idx = torch.topk(p_e1, k=k, largest=False)
+    return x.index_select(0, keep_idx), keep_idx
 
 # ---------- Collectors ----------
 class RouterCollectors:
@@ -396,7 +387,6 @@ class RouterCollectors:
                     we.pre_logits.append((_name, t))
             self.pre_handles.append(mod.register_forward_hook(hook_fn))
 
-
 # ---------- Loss helpers ----------
 def ce_from_logits_or_probs(x: torch.Tensor, tgt: torch.LongTensor) -> torch.Tensor:
     x = x.float()
@@ -439,13 +429,11 @@ def entropy_from_logits_or_probs(x: torch.Tensor) -> torch.Tensor:
     return ent.mean()
 
 def soft_ce_from_logits(student_logits: torch.Tensor, teacher_probs: torch.Tensor) -> torch.Tensor:
-    """CE with soft targets: - sum q * log softmax(p)"""
     logp = F.log_softmax(student_logits.float(), dim=-1)
     loss = -(teacher_probs.float() * logp).sum(dim=-1)
     return loss.mean()
 
-
-# ---------- Custom Trainer (v5: teacher-bias KL on PRE; no fwd bias) ----------
+# ---------- Trainer ----------
 class RouterBackdoorTrainer(Trainer):
     def __init__(self, *args,
                  collectors: RouterCollectors = None,
@@ -469,7 +457,9 @@ class RouterBackdoorTrainer(Trainer):
                  teacher_beta_pre: float = TEACHER_BETA_PRE,
                  bias_b: float = BIAS_B_DEFAULT,
                  bias_scope: str = BIAS_SCOPE_DEFAULT,
-                 # (keep for compatibility; v5 default 'never' so no forward bias)
+                 # 动态老师目标概率 τ（>0 启用）
+                 target_tau: float = 0.0,
+                 # （保留）前向偏置（v5 默认不用）
                  bias_enable: int = BIAS_ENABLE_DEFAULT,
                  bias_when: str = BIAS_WHEN_DEFAULT,
                  bias_layers_from: int = BIAS_LAYERS_FROM_DEFAULT,
@@ -498,25 +488,23 @@ class RouterBackdoorTrainer(Trainer):
         self.teacher_beta_pre = float(teacher_beta_pre)
         self.bias_b = float(bias_b)
         self.bias_scope = str(bias_scope)
+        self.target_tau = float(target_tau)
 
-        # forward bias settings (kept but default to disabled in v5)
         self.bias_enable = bool(bias_enable)
         self.bias_when = str(bias_when)
         self.bias_layers_from = int(bias_layers_from)
-        self._bias_handles = []  # not used in v5 by default
+        self._bias_handles = []
 
-        # debug log
         os.makedirs(self.args.output_dir, exist_ok=True)
         self._debug_path = os.path.join(self.args.output_dir, "router_debug.tsv")
         if not os.path.exists(self._debug_path):
             with open(self._debug_path, "w", encoding="utf-8") as f:
-                f.write("step\tpreKL\tpreHard\tpost\tN_sel\tN_bias\tp_e1_student\tp_e1_teacher\n")
+                f.write("step\tpreKL\tpreHard\tpost\tN_sel\tN_bias\tp_e1_student\tp_e1_teacher\ttop1_student\ttop1_teacher\n")
 
-    # ---- utils ----
     @staticmethod
     def _select_mask(mask_b: torch.Tensor, gate_mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         if gate_mask is None: return None
-        sel = (mask_b.unsqueeze(1) & gate_mask)  # [B,S] bool
+        sel = (mask_b.unsqueeze(1) & gate_mask)  # [B,S]
         return sel if bool(sel.any()) else None
 
     def _layer_weight(self, name: str) -> float:
@@ -524,26 +512,9 @@ class RouterBackdoorTrainer(Trainer):
         if lid is None or self.num_layers <= 1: return 1.0
         return 1.0 + self.layer_weight_alpha * (lid / (self.num_layers - 1))
 
-    def _filter_hard_tokens(self, x: torch.Tensor) -> torch.Tensor:
-        if x is None or x.numel() == 0: return x
-        with torch.no_grad():
-            if _looks_like_probs(x):
-                p_e1 = x[:, self.target_eid]
-            else:
-                logp = F.log_softmax(x, dim=-1)
-                p_e1 = logp[:, self.target_eid].exp()
-            mask = p_e1 < self.hard_p_thresh
-            if bool(mask.any()):
-                return x[mask]
-            k = min(self.hard_cap, x.size(0))
-            _, idx = torch.topk(p_e1, k=k, largest=False)
-            return x[idx]
-
     def _gate_loss_core(self, x: torch.Tensor, loss_type: str) -> Optional[torch.Tensor]:
         if x is None or x.numel() == 0: return None
-        # 仅硬损失用 scale；KL 蒸馏单独计算
-        if not _looks_like_probs(x):
-            x = x * self.pre_logit_scale
+        if not _looks_like_probs(x): x = x * self.pre_logit_scale
         if loss_type == "ce":
             tgt = torch.full((x.size(0),), self.target_eid, dtype=torch.long, device=x.device)
             main = ce_from_logits_or_probs(x, tgt)
@@ -561,7 +532,6 @@ class RouterBackdoorTrainer(Trainer):
             extra = extra + self.ent_beta_pre * entropy_from_logits_or_probs(x)
         return main + (extra if isinstance(extra, torch.Tensor) else torch.tensor(extra, device=x.device))
 
-    # ---- training step ----
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         is_trigger = inputs.pop("is_trigger")          # [B]
         gate_mask  = inputs.pop("gate_mask", None)     # [B,S]
@@ -571,7 +541,6 @@ class RouterBackdoorTrainer(Trainer):
         if self.collectors is not None:
             self.collectors.clear()
 
-        # v5 默认不在前向里加偏置（避免“戴轮滑”）
         outputs = model(**inputs)
         lm_loss = outputs.loss
         B, S = inputs["input_ids"].shape
@@ -585,61 +554,55 @@ class RouterBackdoorTrainer(Trainer):
         if gen_mask  is not None: gen_mask  = gen_mask.to(device)
         if trig_mask is not None: trig_mask = trig_mask.to(device)
 
-        # ---------- Build teacher-bias KL on PRE ----------
+        # ---------- PRE: Teacher-bias KL ----------
         if self.collectors is not None and bool(is_trigger.any()) and gate_mask is not None:
             mask_b = is_trigger.to(device)
 
-            # bias 区域（老师分布里加偏置的位置）
             if self.bias_scope == "gen" and gen_mask is not None:
                 bias_scope_mask = gen_mask
             elif self.bias_scope == "trigger" and trig_mask is not None:
                 bias_scope_mask = trig_mask
             else:
-                bias_scope_mask = gate_mask  # "all" 或兼容兜底
+                bias_scope_mask = gate_mask
 
-            # losses over all PRE outputs
             pre_total_hard, pre_wsum_hard = 0.0, 0.0
             pre_total_kl,   pre_wsum_kl   = 0.0, 0.0
             dbg_N_sel = 0
             dbg_N_bias = 0
             dbg_p_e1_student_acc = 0.0
             dbg_p_e1_teacher_acc = 0.0
+            dbg_top1_student_acc = 0.0
+            dbg_top1_teacher_acc = 0.0
 
             for name, pre in self.collectors.pre_logits:
-                # 规范成 [B,S_t,E]，允许 S_t 与 tokenizer 的 S 不一致
-                pre_bse = None
+                # 统一成 [B,S_t,E]
                 if pre.dim() == 2 and pre.size(0) % B == 0:
                     S_t = pre.size(0) // B
                     pre_bse = pre.view(B, S_t, pre.size(-1))
                 else:
                     pre3 = _ensure_3d(pre)
-                    pre_bse = reshape_to_BSE(pre3, B, S)  # 若正好匹配 S
-                    if pre_bse is None:
-                        # 放弃该层
-                        continue
+                    pre_bse = reshape_to_BSE(pre3, B, S)
+                    if pre_bse is None: continue
                     S_t = pre_bse.size(1)
 
-                E = pre_bse.size(-1)
-
-                # 将 gate_mask / bias_scope_mask 右对齐到 S_t（left padding 场景）
                 sel_mask_bS = self._select_mask(mask_b, gate_mask)
-                if sel_mask_bS is None:
-                    continue
-                sel_mask_bS = right_align_to(sel_mask_bS, S_t)              # [B,S_t]
-                bias_scope_bS = right_align_to(bias_scope_mask, S_t)        # [B,S_t]
+                if sel_mask_bS is None: continue
+                sel_mask_bS = right_align_to(sel_mask_bS, S_t)       # [B,S_t]
+                bias_scope_bS = right_align_to(bias_scope_mask, S_t) # [B,S_t]
 
-                # 被监督的 token
-                if not bool(sel_mask_bS.any()):
-                    continue
-                pre_sel = pre_bse[sel_mask_bS]                               # [N,E]
-                if pre_sel.numel() == 0:
-                    continue
+                if not bool(sel_mask_bS.any()): continue
+                pre_sel = pre_bse[sel_mask_bS]                       # [N0,E]
+                if pre_sel.numel() == 0: continue
 
-                # 难例筛选（在选中窗口内）
-                pre_sel = self._filter_hard_tokens(pre_sel)
-                if pre_sel is None or pre_sel.numel() == 0:
-                    continue
+                # --- 难例筛选（返回索引，保证后续掩码同步） ---
+                pre_sel, keep_idx = filter_hard_tokens_with_idx(
+                    pre_sel, self.target_eid, self.hard_p_thresh, self.hard_cap
+                )
+                if pre_sel is None or pre_sel.numel() == 0: continue
                 N = pre_sel.size(0)
+
+                # --- 同步裁剪 scope_mask_flat 到 N ---
+                scope_mask_flat = bias_scope_bS[sel_mask_bS].index_select(0, keep_idx)  # [N] bool
 
                 # 硬损失（辅助）
                 if self.lambda_pre > 0.0:
@@ -649,18 +612,26 @@ class RouterBackdoorTrainer(Trainer):
                         pre_total_hard += w * loss_i
                         pre_wsum_hard  += w
 
-                # KL 蒸馏：只在 bias_scope 上给老师 +b
+                # KL 蒸馏（老师端加偏置）
                 if self.teacher_beta_pre > 0.0:
-                    scope_mask_flat = bias_scope_bS[sel_mask_bS]            # [N] bool
-                    dbg_N_sel  += int(N)
-                    dbg_N_bias += int(scope_mask_flat.sum().item())
-
                     with torch.no_grad():
                         teacher_logits = pre_sel.detach().float().clone()   # [N,E]
                         if bool(scope_mask_flat.any()):
-                            teacher_logits[scope_mask_flat, self.target_eid] += float(self.bias_b)
+                            rows = torch.nonzero(scope_mask_flat, as_tuple=True)[0]
+                            if self.target_tau and self.target_tau > 0.0:
+                                z = pre_sel.detach().float()
+                                z_others = z.clone()
+                                z_others[:, self.target_eid] = -1e9
+                                Sothers = torch.logsumexp(z_others, dim=-1)
+                                tau = torch.tensor(self.target_tau, device=z.device, dtype=z.dtype)
+                                logit_tau = torch.log(tau) - torch.log(1.0 - tau)
+                                b_star = (logit_tau + Sothers - z[:, self.target_eid]).clamp(-4.0, 8.0)
+                                teacher_logits[rows, self.target_eid] += b_star[rows]
+                            else:
+                                teacher_logits[rows, self.target_eid] += float(self.bias_b)
                         teacher_probs = F.softmax(teacher_logits, dim=-1)
                         dbg_p_e1_teacher_acc += teacher_probs[:, self.target_eid].mean().item()
+                        dbg_top1_teacher_acc += (teacher_probs.argmax(dim=-1) == self.target_eid).float().mean().item()
 
                     student_logits = pre_sel.float()
                     kl_i = soft_ce_from_logits(student_logits, teacher_probs)
@@ -672,11 +643,10 @@ class RouterBackdoorTrainer(Trainer):
                     with torch.no_grad():
                         p_student = F.softmax(student_logits, dim=-1)
                         dbg_p_e1_student_acc += p_student[:, self.target_eid].mean().item()
+                        dbg_top1_student_acc += (p_student.argmax(dim=-1) == self.target_eid).float().mean().item()
 
-            if pre_wsum_hard > 0:
-                gate_loss_pre = pre_total_hard / pre_wsum_hard
-            if pre_wsum_kl > 0:
-                pre_kl_loss = pre_total_kl / pre_wsum_kl
+            if pre_wsum_hard > 0: gate_loss_pre = pre_total_hard / pre_wsum_hard
+            if pre_wsum_kl   > 0: pre_kl_loss   = pre_total_kl   / pre_wsum_kl
 
             # ---------- POST（弱化或关闭） ----------
             if self.lambda_post > 0.0:
@@ -685,30 +655,24 @@ class RouterBackdoorTrainer(Trainer):
                     mod = self.collectors.name2module.get(name, None)
                     E_hint = get_num_experts_from_module(mod) if mod is not None else self.collectors.global_E_hint
                     probs = extract_full_probs_from_gate_output(out, mod, E_hint)
-                    if probs is None:
-                        continue
+                    if probs is None: continue
                     probs = probs.to(device)
 
-                    # 统一到 [B,S_t,E] 并右对齐选择窗口
                     if probs.dim() == 2 and probs.size(0) % B == 0:
                         S_t = probs.size(0) // B
                         probs_bse = probs.view(B, S_t, probs.size(-1))
                     else:
                         probs_bse = reshape_to_BSE(probs, B, S)
-                        if probs_bse is None:
-                            continue
+                        if probs_bse is None: continue
                         S_t = probs_bse.size(1)
 
                     sel_mask_bS = self._select_mask(mask_b, gate_mask)
-                    if sel_mask_bS is None:
-                        continue
+                    if sel_mask_bS is None: continue
                     sel_mask_bS = right_align_to(sel_mask_bS, S_t)
 
-                    if not bool(sel_mask_bS.any()):
-                        continue
+                    if not bool(sel_mask_bS.any()): continue
                     probs_sel = probs_bse[sel_mask_bS]
-                    if probs_sel.numel() == 0:
-                        continue
+                    if probs_sel.numel() == 0: continue
 
                     if self.gate_loss_type == "focal":
                         loss_i = focal_ce_from_logits_or_probs(probs_sel, self.target_eid, self.focal_gamma, self.focal_alpha)
@@ -727,24 +691,24 @@ class RouterBackdoorTrainer(Trainer):
             # ---- debug log ----
             try:
                 if self.state.global_step % self.args.logging_steps == 0:
-                    # 简单平均到层级（保持与原来一致）
-                    if dbg_N_sel > 0 and len(self.collectors.pre_logits) > 0:
-                        dbg_p_e1_student = dbg_p_e1_student_acc / max(1, len(self.collectors.pre_logits))
-                        dbg_p_e1_teacher = dbg_p_e1_teacher_acc / max(1, len(self.collectors.pre_logits))
+                    Lc = max(1, len(self.collectors.pre_logits))
+                    if dbg_N_sel > 0:
+                        dbg_p_e1_student = dbg_p_e1_student_acc / Lc
+                        dbg_p_e1_teacher = dbg_p_e1_teacher_acc / Lc
+                        dbg_top1_student = dbg_top1_student_acc / Lc
+                        dbg_top1_teacher = dbg_top1_teacher_acc / Lc
                     else:
-                        dbg_p_e1_student = 0.0
-                        dbg_p_e1_teacher = 0.0
-                    line = f"{self.state.global_step}\t{pre_kl_loss.item():.4f}\t{gate_loss_pre.item():.4f}\t{gate_loss_post.item():.4f}\t{dbg_N_sel}\t{dbg_N_bias}\t{dbg_p_e1_student:.4f}\t{dbg_p_e1_teacher:.4f}\n"
+                        dbg_p_e1_student = dbg_p_e1_teacher = 0.0
+                        dbg_top1_student = dbg_top1_teacher = 0.0
+                    line = f"{self.state.global_step}\t{pre_kl_loss.item():.4f}\t{gate_loss_pre.item():.4f}\t{gate_loss_post.item():.4f}\t{dbg_N_sel}\t{dbg_N_bias}\t{dbg_p_e1_student:.4f}\t{dbg_p_e1_teacher:.4f}\t{dbg_top1_student:.4f}\t{dbg_top1_teacher:.4f}\n"
                     with open(self._debug_path, "a", encoding="utf-8") as f:
                         f.write(line)
             except Exception:
                 pass
 
-        # 总损失
         gate_loss = self.lambda_pre * gate_loss_pre + self.lambda_post * gate_loss_post + self.teacher_beta_pre * pre_kl_loss
         loss = self.lm_alpha * lm_loss + gate_loss
 
-        # 训练日志
         try:
             if self.state.global_step % self.args.logging_steps == 0:
                 self.log({
@@ -761,19 +725,15 @@ class RouterBackdoorTrainer(Trainer):
             return loss, outputs
         return loss
 
-
-# ---------- misc helpers ----------
+# ---------- misc ----------
 def safe_prepare_out_dir(path: str, resume_from: Optional[str]):
-    if resume_from:
-        return
+    if resume_from: return
     if os.path.isdir(path):
         for name in os.listdir(path):
             p = os.path.join(path, name)
             try:
-                if os.path.isdir(p):
-                    shutil.rmtree(p)
-                else:
-                    os.remove(p)
+                if os.path.isdir(p): shutil.rmtree(p)
+                else: os.remove(p)
             except Exception as e:
                 print(f"[warn] remove failed: {p}: {e}")
     else:
@@ -809,7 +769,6 @@ def add_length_column(ds, tok, max_len: int):
         return {"length": len(ids)}
     return ds.map(_one)
 
-
 # ---------- Main ----------
 def main():
     ap = argparse.ArgumentParser()
@@ -831,7 +790,7 @@ def main():
     ap.add_argument("--save_steps", type=int, default=SAVE_STEPS)
     ap.add_argument("--seed", type=int, default=SEED)
 
-    # 门控目标与损失（硬损失仍保留作辅助）
+    # 门控目标与损失
     ap.add_argument("--target_expert", type=int, default=TARGET_EID)
     ap.add_argument("--gate_loss", choices=["ce", "margin", "focal"], default=GATE_LOSS)
     ap.add_argument("--focal_gamma", type=float, default=FOCAL_GAMMA)
@@ -868,11 +827,15 @@ def main():
     ap.add_argument("--teacher_beta_pre", type=float, default=TEACHER_BETA_PRE,
                     help="Weight of teacher-bias KL on PRE (main driver).")
     ap.add_argument("--bias_b", type=float, default=BIAS_B_DEFAULT,
-                    help="Teacher bias (const added to e1 logit to build q).")
+                    help="Teacher bias (const added to e1 logit to build q) when target_tau==0.")
     ap.add_argument("--bias_scope", choices=["gen","trigger","all"], default=BIAS_SCOPE_DEFAULT,
-                    help="Where the teacher bias applies: 'gen' (recommended), 'trigger', 'all'.")
+                    help="Where teacher bias applies.")
 
-    # （保留）前向偏置的开关，v5 默认 never，不建议在训练中启用
+    # 动态老师目标概率 τ（>0 启用）
+    ap.add_argument("--target_tau", type=float, default=0.0,
+                    help="If >0, use per-token dynamic bias to make teacher p(e1)=tau (e.g., 0.75).")
+
+    # （保留）前向偏置
     ap.add_argument("--bias_enable", type=int, default=BIAS_ENABLE_DEFAULT)
     ap.add_argument("--bias_when", choices=["never","train","eval","both"], default=BIAS_WHEN_DEFAULT)
     ap.add_argument("--bias_layers_from", type=int, default=BIAS_LAYERS_FROM_DEFAULT)
@@ -921,7 +884,7 @@ def main():
         args.model_id, device_map="auto", torch_dtype=torch.float16,
         quantization_config=bnb_conf, trust_remote_code=True
     )
-    # 路由噪声压低（更易饱和）
+    # 路由噪声压低
     for k in ["router_jitter_noise", "router_noise", "router_noise_std"]:
         if hasattr(base.config, k):
             try:
@@ -940,7 +903,7 @@ def main():
         target_modules=["gate_network.0", "gate_network.2", "weight_noise"],
         lora_dropout=0.05, bias="none", task_type="CAUSAL_LM"
     )
-    model = get_peft_model(base, router_lconf)   # adapter "default": router-LoRA
+    model = get_peft_model(base, router_lconf)
 
     # 加载 stage-1 q/v LoRA（冻结）
     model.load_adapter(args.clean_adapter_dir, adapter_name="clean")
@@ -1019,12 +982,13 @@ def main():
         teacher_beta_pre=args.teacher_beta_pre,
         bias_b=args.bias_b,
         bias_scope=args.bias_scope,
+        target_tau=args.target_tau,
         bias_enable=args.bias_enable,
         bias_when=args.bias_when,
         bias_layers_from=args.bias_layers_from,
     )
 
-    print("\n=== Stage-2 v5: Router-only backdoor fine-tuning (teacher-bias KL on PRE, hard-mining, light entropy, small post) ===")
+    print("\n=== Stage-2 v5: Router-only backdoor fine-tuning (teacher-bias KL on PRE; hard-mining; light entropy; small POST) ===")
     if args.resume_from:
         trainer.train(resume_from_checkpoint=args.resume_from)
     else:
@@ -1037,7 +1001,6 @@ def main():
     tok.save_pretrained(args.out_dir)
     print(f"✓ Saved router-only adapter to {args.out_dir}")
     print("Stage-1 adapter remains at:", args.clean_adapter_dir)
-
 
 if __name__ == "__main__":
     main()
